@@ -35,8 +35,8 @@ import (
 	rpc "github.com/libp2p/go-libp2p-gorpc"
 	gostream "github.com/libp2p/go-libp2p-gostream"
 	p2phttp "github.com/libp2p/go-libp2p-http"
+	noise "github.com/libp2p/go-libp2p-noise"
 	libp2pquic "github.com/libp2p/go-libp2p-quic-transport"
-	secio "github.com/libp2p/go-libp2p-secio"
 	libp2ptls "github.com/libp2p/go-libp2p-tls"
 	manet "github.com/multiformats/go-multiaddr/net"
 
@@ -239,8 +239,8 @@ func (api *API) setupLibp2p() error {
 			context.Background(),
 			libp2p.Identity(api.config.PrivateKey),
 			libp2p.ListenAddrs(api.config.Libp2pListenAddr...),
+			libp2p.Security(noise.ID, noise.New),
 			libp2p.Security(libp2ptls.ID, libp2ptls.New),
-			libp2p.Security(secio.ID, secio.New),
 			libp2p.Transport(libp2pquic.NewTransport),
 			libp2p.DefaultTransports,
 		)
@@ -467,6 +467,12 @@ func (api *API) routes() []route {
 			api.graphHandler,
 		},
 		{
+			"Alerts",
+			"GET",
+			"/health/alerts",
+			api.alertsHandler,
+		},
+		{
 			"Metrics",
 			"GET",
 			"/monitor/metrics/{name}",
@@ -659,6 +665,19 @@ func (api *API) metricNamesHandler(w http.ResponseWriter, r *http.Request) {
 	api.sendResponse(w, autoStatus, err, metricNames)
 }
 
+func (api *API) alertsHandler(w http.ResponseWriter, r *http.Request) {
+	var alerts []types.Alert
+	err := api.rpcClient.CallContext(
+		r.Context(),
+		"",
+		"Cluster",
+		"Alerts",
+		struct{}{},
+		&alerts,
+	)
+	api.sendResponse(w, autoStatus, err, alerts)
+}
+
 func (api *API) addHandler(w http.ResponseWriter, r *http.Request) {
 	reader, err := r.MultipartReader()
 	if err != nil {
@@ -843,11 +862,18 @@ func (api *API) allocationsHandler(w http.ResponseWriter, r *http.Request) {
 		struct{}{},
 		&pins,
 	)
-	outPins := make([]*types.Pin, 0)
-	for _, pin := range pins {
-		if filter&pin.Type > 0 {
-			// add this pin to output
-			outPins = append(outPins, pin)
+
+	var outPins []*types.Pin
+
+	if filter == types.AllType {
+		outPins = pins
+	} else {
+		outPins = make([]*types.Pin, 0, len(pins))
+		for _, pin := range pins {
+			if filter&pin.Type > 0 {
+				// add this pin to output
+				outPins = append(outPins, pin)
+			}
 		}
 	}
 	api.sendResponse(w, autoStatus, err, outPins)
@@ -872,30 +898,6 @@ func (api *API) allocationHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// filterGlobalPinInfos takes a GlobalPinInfo slice and discards
-// any item in it which does not carry a PinInfo matching the
-// filter (OR-wise).
-func filterGlobalPinInfos(globalPinInfos []*types.GlobalPinInfo, filter types.TrackerStatus) []*types.GlobalPinInfo {
-	if filter == types.TrackerStatusUndefined {
-		return globalPinInfos
-	}
-
-	var filteredGlobalPinInfos []*types.GlobalPinInfo
-
-	for _, globalPinInfo := range globalPinInfos {
-		for _, pinInfo := range globalPinInfo.PeerMap {
-			// silenced the error because we should have detected
-			// earlier if filters were invalid
-			if pinInfo.Status.Match(filter) {
-				filteredGlobalPinInfos = append(filteredGlobalPinInfos, globalPinInfo)
-				break
-			}
-		}
-	}
-
-	return filteredGlobalPinInfos
-}
-
 func (api *API) statusAllHandler(w http.ResponseWriter, r *http.Request) {
 	queryValues := r.URL.Query()
 	local := queryValues.Get("local")
@@ -917,7 +919,7 @@ func (api *API) statusAllHandler(w http.ResponseWriter, r *http.Request) {
 			"",
 			"Cluster",
 			"StatusAllLocal",
-			struct{}{},
+			filter,
 			&pinInfos,
 		)
 		if err != nil {
@@ -931,7 +933,7 @@ func (api *API) statusAllHandler(w http.ResponseWriter, r *http.Request) {
 			"",
 			"Cluster",
 			"StatusAll",
-			struct{}{},
+			filter,
 			&globalPinInfos,
 		)
 		if err != nil {
@@ -939,8 +941,6 @@ func (api *API) statusAllHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-
-	globalPinInfos = filterGlobalPinInfos(globalPinInfos, filter)
 
 	api.sendResponse(w, autoStatus, nil, globalPinInfos)
 }

@@ -1,4 +1,4 @@
-FROM golang:1.15-buster AS builder
+FROM golang:1.16-buster AS builder
 MAINTAINER Hector Sanjuan <hector@protocol.ai>
 
 # This build state just builds the cluster binaries
@@ -30,6 +30,7 @@ ENV GOPATH                                      /go
 ENV SRC_PATH                                    /go/src/github.com/ipfs/ipfs-cluster
 ENV IPFS_CLUSTER_PATH                           /data/ipfs-cluster
 ENV IPFS_CLUSTER_CONSENSUS                      crdt
+ENV IPFS_CLUSTER_DATASTORE                      leveldb
 ENV IPFS_CLUSTER_RESTAPI_HTTPLISTENMULTIADDRESS /ip4/0.0.0.0/tcp/9094
 ENV IPFS_CLUSTER_IPFSPROXY_LISTENMULTIADDRESS   /ip4/0.0.0.0/tcp/9095
 
@@ -51,7 +52,7 @@ COPY --from=builder /tmp/jq-linux64 /usr/local/bin/jq
 
 # Add bash
 COPY --from=builder /bin/bash /bin/bash
-COPY --from=builder /lib/x86_64-linux-gnu/libtinfo.so* /lib64/
+COPY --from=builder /lib/*-linux-gnu*/libtinfo.so* /lib64/
 
 USER root
 

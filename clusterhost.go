@@ -4,15 +4,16 @@ import (
 	"context"
 	"encoding/hex"
 
-	"github.com/ipfs/go-datastore"
-	"github.com/ipfs/go-datastore/namespace"
+	ds "github.com/ipfs/go-datastore"
+	namespace "github.com/ipfs/go-datastore/namespace"
 	ipns "github.com/ipfs/go-ipns"
-	"github.com/ipfs/ipfs-cluster/config"
+	config "github.com/ipfs/ipfs-cluster/config"
 	libp2p "github.com/libp2p/go-libp2p"
 	relay "github.com/libp2p/go-libp2p-circuit"
 	connmgr "github.com/libp2p/go-libp2p-connmgr"
 	crypto "github.com/libp2p/go-libp2p-core/crypto"
 	host "github.com/libp2p/go-libp2p-core/host"
+	network "github.com/libp2p/go-libp2p-core/network"
 	corepnet "github.com/libp2p/go-libp2p-core/pnet"
 	routing "github.com/libp2p/go-libp2p-core/routing"
 	dht "github.com/libp2p/go-libp2p-kad-dht"
@@ -49,8 +50,14 @@ func NewClusterHost(
 	ctx context.Context,
 	ident *config.Identity,
 	cfg *Config,
-	ds datastore.Datastore,
+	ds ds.Datastore,
 ) (host.Host, *pubsub.PubSub, *dual.DHT, error) {
+
+	// Set the default dial timeout for all libp2p connections.  It is not
+	// very good to touch this global variable here, but the alternative
+	// is to used a modify context everywhere, even if the user supplies
+	// it.
+	network.DialPeerTimeout = cfg.DialPeerTimeout
 
 	connman := connmgr.NewConnManager(cfg.ConnMgr.LowWater, cfg.ConnMgr.HighWater, cfg.ConnMgr.GracePeriod)
 
@@ -124,7 +131,7 @@ func baseOpts(psk corepnet.PSK) []libp2p.Option {
 	}
 }
 
-func newDHT(ctx context.Context, h host.Host, store datastore.Datastore, extraopts ...dual.Option) (*dual.DHT, error) {
+func newDHT(ctx context.Context, h host.Host, store ds.Datastore, extraopts ...dual.Option) (*dual.DHT, error) {
 	opts := []dual.Option{
 		dual.DHTOption(dht.NamespacedValidator("pk", record.PublicKeyValidator{})),
 		dual.DHTOption(dht.NamespacedValidator("ipns", ipns.Validator{KeyBook: h.Peerstore()})),
@@ -133,8 +140,8 @@ func newDHT(ctx context.Context, h host.Host, store datastore.Datastore, extraop
 
 	opts = append(opts, extraopts...)
 
-	if batchingDs, ok := store.(datastore.Batching); ok {
-		dhtDatastore := namespace.Wrap(batchingDs, datastore.NewKey(dhtNamespace))
+	if batchingDs, ok := store.(ds.Batching); ok {
+		dhtDatastore := namespace.Wrap(batchingDs, ds.NewKey(dhtNamespace))
 		opts = append(opts, dual.DHTOption(dht.Datastore(dhtDatastore)))
 		logger.Debug("enabling DHT record persistence to datastore")
 	}

@@ -22,6 +22,7 @@ import (
 	handlers "github.com/gorilla/handlers"
 	mux "github.com/gorilla/mux"
 	cid "github.com/ipfs/go-cid"
+	cmd "github.com/ipfs/go-ipfs-cmds"
 	logging "github.com/ipfs/go-log/v2"
 	path "github.com/ipfs/go-path"
 	peer "github.com/libp2p/go-libp2p-core/peer"
@@ -67,10 +68,6 @@ type Server struct {
 	shutdownLock sync.Mutex
 	shutdown     bool
 	wg           sync.WaitGroup
-}
-
-type ipfsError struct {
-	Message string
 }
 
 type ipfsPinType struct {
@@ -332,7 +329,8 @@ func (proxy *Server) run() {
 
 // ipfsErrorResponder writes an http error response just like IPFS would.
 func ipfsErrorResponder(w http.ResponseWriter, errMsg string, code int) {
-	res := ipfsError{errMsg}
+	res := cmd.Errorf(cmd.ErrNormal, errMsg)
+
 	resBytes, _ := json.Marshal(res)
 	if code > 0 {
 		w.WriteHeader(code)
@@ -563,9 +561,13 @@ func (proxy *Server) addHandler(w http.ResponseWriter, r *http.Request) {
 	logger.Warnf("Proxy/add does not support all IPFS params. Current options: %+v", params)
 
 	outputTransform := func(in *api.AddedOutput) interface{} {
+		cidStr := ""
+		if in.Cid.Defined() {
+			cidStr = in.Cid.String()
+		}
 		r := &ipfsAddResp{
 			Name:  in.Name,
-			Hash:  in.Cid.String(),
+			Hash:  cidStr,
 			Bytes: int64(in.Bytes),
 		}
 		if in.Size != 0 {

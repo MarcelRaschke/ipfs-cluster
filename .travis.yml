@@ -3,7 +3,7 @@ os:
   - linux
 #  - osx
 go:
-- '1.15.x'
+- '1.16.x'
 services:
 - docker
 
@@ -30,10 +30,12 @@ jobs:
     - name: "Main Tests with raft consensus"
       script:
         - travis_wait go test -v -timeout 15m -failfast -consensus raft .
+    - name: "Main Tests with leveldb backend"
+      script:
+        - travis_wait go test -v -timeout 15m -failfast -datastore leveldb .
     - name: "Golint, go vet, binary builds"
       script:
-        - go get -u golang.org/x/lint/golint
-        - go get honnef.co/go/tools/cmd/staticcheck
+        - go install honnef.co/go/tools/cmd/staticcheck@latest
         - make check
         - make service
         - make ctl

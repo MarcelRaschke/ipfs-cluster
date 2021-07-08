@@ -21,14 +21,15 @@ import (
 
 	cid "github.com/ipfs/go-cid"
 	files "github.com/ipfs/go-ipfs-files"
-	pinner "github.com/ipfs/go-ipfs-pinner"
+	dspinner "github.com/ipfs/go-ipfs-pinner/dspinner"
+	ipldpinner "github.com/ipfs/go-ipfs-pinner/ipldpinner"
 	logging "github.com/ipfs/go-log/v2"
 	gopath "github.com/ipfs/go-path"
 	peer "github.com/libp2p/go-libp2p-core/peer"
 	rpc "github.com/libp2p/go-libp2p-gorpc"
 	madns "github.com/multiformats/go-multiaddr-dns"
 	manet "github.com/multiformats/go-multiaddr/net"
-	"github.com/multiformats/go-multihash"
+	multihash "github.com/multiformats/go-multihash"
 
 	"go.opencensus.io/plugin/ochttp"
 	"go.opencensus.io/plugin/ochttp/propagation/tracecontext"
@@ -325,6 +326,29 @@ func (ipfs *Connector) Pin(ctx context.Context, pin *api.Pin) error {
 	ctx, cancelRequest := context.WithCancel(ctx)
 	defer cancelRequest()
 
+	// If the pin has origins, tell ipfs to connect to a maximum of 10.
+	bound := len(pin.Origins)
+	if bound > 10 {
+		bound = 10
+	}
+	for _, orig := range pin.Origins[0:bound] {
+		// do it in the background, ignoring errors.
+		go func(o string) {
+			logger.Debugf("swarm-connect to origin before pinning: %s", o)
+			_, err := ipfs.postCtx(
+				ctx,
+				fmt.Sprintf("swarm/connect?arg=%s", o),
+				"",
+				nil,
+			)
+			if err != nil {
+				logger.Debug(err)
+				return
+			}
+			logger.Debugf("swarm-connect success to origin: %s", o)
+		}(url.QueryEscape(orig.String()))
+	}
+
 	// If we have a pin-update, and the old object
 	// is pinned recursively, then do pin/update.
 	// Otherwise do a normal pin.
@@ -462,7 +486,9 @@ func (ipfs *Connector) Unpin(ctx context.Context, hash cid.Cid) error {
 	_, err := ipfs.postCtx(ctx, path, "", nil)
 	if err != nil {
 		ipfsErr, ok := err.(ipfsError)
-		if !ok || ipfsErr.Message != pinner.ErrNotPinned.Error() {
+		if !ok ||
+			(ipfsErr.Message != dspinner.ErrNotPinned.Error() &&
+				ipfsErr.Message != ipldpinner.ErrNotPinned.Error()) {
 			return err
 		}
 		logger.Debug("IPFS object is already unpinned: ", hash)
@@ -651,7 +677,7 @@ func (ipfs *Connector) ConnectSwarms(ctx context.Context) error {
 			// when passing in a bunch of addresses
 			_, err := ipfs.postCtx(
 				ctx,
-				fmt.Sprintf("swarm/connect?arg=%s", addr.String()),
+				fmt.Sprintf("swarm/connect?arg=%s", url.QueryEscape(addr.String())),
 				"",
 				nil,
 			)

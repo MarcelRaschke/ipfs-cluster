@@ -42,6 +42,7 @@ const (
 	bootstrapCount      = 3
 	reBootstrapInterval = 30 * time.Second
 	mdnsServiceTag      = "_ipfs-cluster-discovery._udp"
+	maxAlerts           = 1000
 )
 
 var (
@@ -73,6 +74,9 @@ type Cluster struct {
 	allocator PinAllocator
 	informers []Informer
 	tracer    Tracer
+
+	alerts    []api.Alert
+	alertsMux sync.Mutex
 
 	doneCh  chan struct{}
 	readyCh chan struct{}
@@ -137,10 +141,10 @@ func NewCluster(
 	if cfg.MDNSInterval > 0 {
 		mdns, err := discovery.NewMdnsService(ctx, host, cfg.MDNSInterval, mdnsServiceTag)
 		if err != nil {
-			cancel()
-			return nil, err
+			logger.Warnf("mDNS could not be started: %s", err)
+		} else {
+			mdns.RegisterNotifee(peerManager)
 		}
-		mdns.RegisterNotifee(peerManager)
 	}
 
 	c := &Cluster{
@@ -160,6 +164,7 @@ func NewCluster(
 		allocator:   allocator,
 		informers:   informers,
 		tracer:      tracer,
+		alerts:      []api.Alert{},
 		peerManager: peerManager,
 		shutdownB:   false,
 		removed:     false,
@@ -384,6 +389,23 @@ func (c *Cluster) pushPingMetrics(ctx context.Context) {
 	}
 }
 
+// Alerts returns the last alerts recorded by this cluster peer with the most
+// recent first.
+func (c *Cluster) Alerts() []api.Alert {
+	alerts := make([]api.Alert, len(c.alerts))
+
+	c.alertsMux.Lock()
+	{
+		total := len(alerts)
+		for i, a := range c.alerts {
+			alerts[total-1-i] = a
+		}
+	}
+	c.alertsMux.Unlock()
+
+	return alerts
+}
+
 // read the alerts channel from the monitor and triggers repins
 func (c *Cluster) alertsHandler() {
 	for {
@@ -397,8 +419,18 @@ func (c *Cluster) alertsHandler() {
 				continue
 			}
 
-			logger.Warnf("metric alert for %s: Peer: %s.", alrt.MetricName, alrt.Peer)
-			if alrt.MetricName != pingMetricName {
+			logger.Warnf("metric alert for %s: Peer: %s.", alrt.Name, alrt.Peer)
+			c.alertsMux.Lock()
+			{
+				if len(c.alerts) > maxAlerts {
+					c.alerts = c.alerts[:0]
+				}
+
+				c.alerts = append(c.alerts, *alrt)
+			}
+			c.alertsMux.Unlock()
+
+			if alrt.Name != pingMetricName {
 				continue // only handle ping alerts
 			}
 
@@ -1055,21 +1087,21 @@ func (c *Cluster) StateSync(ctx context.Context) error {
 // StatusAll returns the GlobalPinInfo for all tracked Cids in all peers.
 // If an error happens, the slice will contain as much information as
 // could be fetched from other peers.
-func (c *Cluster) StatusAll(ctx context.Context) ([]*api.GlobalPinInfo, error) {
+func (c *Cluster) StatusAll(ctx context.Context, filter api.TrackerStatus) ([]*api.GlobalPinInfo, error) {
 	_, span := trace.StartSpan(ctx, "cluster/StatusAll")
 	defer span.End()
 	ctx = trace.NewContext(c.ctx, span)
 
-	return c.globalPinInfoSlice(ctx, "PinTracker", "StatusAll")
+	return c.globalPinInfoSlice(ctx, "PinTracker", "StatusAll", filter)
 }
 
 // StatusAllLocal returns the PinInfo for all the tracked Cids in this peer.
-func (c *Cluster) StatusAllLocal(ctx context.Context) []*api.PinInfo {
+func (c *Cluster) StatusAllLocal(ctx context.Context, filter api.TrackerStatus) []*api.PinInfo {
 	_, span := trace.StartSpan(ctx, "cluster/StatusAllLocal")
 	defer span.End()
 	ctx = trace.NewContext(c.ctx, span)
 
-	return c.tracker.StatusAll(ctx)
+	return c.tracker.StatusAll(ctx, filter)
 }
 
 // Status returns the GlobalPinInfo for a given Cid as fetched from all
@@ -1125,7 +1157,7 @@ func (c *Cluster) RecoverAll(ctx context.Context) ([]*api.GlobalPinInfo, error) 
 	defer span.End()
 	ctx = trace.NewContext(c.ctx, span)
 
-	return c.globalPinInfoSlice(ctx, "Cluster", "RecoverAllLocal")
+	return c.globalPinInfoSlice(ctx, "Cluster", "RecoverAllLocal", nil)
 }
 
 // RecoverAllLocal triggers a RecoverLocal operation for all Cids tracked
@@ -1256,6 +1288,15 @@ func (c *Cluster) setupReplicationFactor(pin *api.Pin) error {
 		pin.ReplicationFactorMax = rplMax
 	}
 
+	// When pinning everywhere, remove all allocations.
+	// Allocations may have been preset by the adder
+	// for the cases when the replication factor is > -1.
+	// Fixes part of #1319: allocations when adding
+	// are kept.
+	if pin.IsPinEverywhere() {
+		pin.Allocations = nil
+	}
+
 	return isReplicationFactorValid(rplMin, rplMax)
 }
 
@@ -1285,7 +1326,7 @@ func checkPinType(pin *api.Pin) error {
 			return errors.New("clusterDAG pins should reference a Meta pin")
 		}
 	case api.MetaType:
-		if pin.Allocations != nil && len(pin.Allocations) != 0 {
+		if len(pin.Allocations) != 0 {
 			return errors.New("meta pin should not specify allocations")
 		}
 		if pin.Reference == nil {
@@ -1395,6 +1436,8 @@ func (c *Cluster) pin(
 	// allocate() will check which peers are currently allocated
 	// and try to respect them.
 	if len(pin.Allocations) == 0 {
+		// If replication factor is -1, this will return empty
+		// allocations.
 		allocs, err := c.allocate(
 			ctx,
 			pin.Cid,
@@ -1410,6 +1453,7 @@ func (c *Cluster) pin(
 		pin.Allocations = allocs
 	}
 
+	// If this is true, replication factor should be -1.
 	if len(pin.Allocations) == 0 {
 		logger.Infof("pinning %s everywhere:", pin.Cid)
 	} else {
@@ -1586,7 +1630,10 @@ func (c *Cluster) Peers(ctx context.Context) []*api.ID {
 
 	peers := make([]*api.ID, lenMembers)
 
-	ctxs, cancels := rpcutil.CtxsWithCancel(ctx, lenMembers)
+	// We should be done relatively quickly with this call. Otherwise
+	// report errors.
+	timeout := 15 * time.Second
+	ctxs, cancels := rpcutil.CtxsWithTimeout(ctx, lenMembers, timeout)
 	defer rpcutil.MultiCancel(cancels)
 
 	errs := c.rpcClient.MultiCall(
@@ -1715,7 +1762,7 @@ func (c *Cluster) globalPinInfoCid(ctx context.Context, comp, method string, h c
 			return nil, err
 		}
 
-		if len(pin.Allocations) > 0 {
+		if !pin.IsPinEverywhere() {
 			dests = pin.Allocations
 			remote = peersSubtract(members, dests)
 		} else {
@@ -1729,7 +1776,11 @@ func (c *Cluster) globalPinInfoCid(ctx context.Context, comp, method string, h c
 
 	lenDests := len(dests)
 	replies := make([]*api.PinInfo, lenDests)
-	ctxs, cancels := rpcutil.CtxsWithCancel(ctx, lenDests)
+
+	// a globalPinInfo type of request should be relatively fast. We
+	// cannot block response indefinitely due to an unresponsive node.
+	timeout := 15 * time.Second
+	ctxs, cancels := rpcutil.CtxsWithTimeout(ctx, lenDests, timeout)
 	defer rpcutil.MultiCancel(cancels)
 
 	errs := c.rpcClient.MultiCall(
@@ -1773,9 +1824,13 @@ func (c *Cluster) globalPinInfoCid(ctx context.Context, comp, method string, h c
 	return gpin, nil
 }
 
-func (c *Cluster) globalPinInfoSlice(ctx context.Context, comp, method string) ([]*api.GlobalPinInfo, error) {
+func (c *Cluster) globalPinInfoSlice(ctx context.Context, comp, method string, arg interface{}) ([]*api.GlobalPinInfo, error) {
 	ctx, span := trace.StartSpan(ctx, "cluster/globalPinInfoSlice")
 	defer span.End()
+
+	if arg == nil {
+		arg = struct{}{}
+	}
 
 	infos := make([]*api.GlobalPinInfo, 0)
 	fullMap := make(map[cid.Cid]*api.GlobalPinInfo)
@@ -1795,6 +1850,9 @@ func (c *Cluster) globalPinInfoSlice(ctx context.Context, comp, method string) (
 
 	replies := make([][]*api.PinInfo, lenMembers)
 
+	// We don't have a good timeout proposal for this. Depending on the
+	// size of the state and the peformance of IPFS and the network, this
+	// may take moderately long.
 	ctxs, cancels := rpcutil.CtxsWithCancel(ctx, lenMembers)
 	defer rpcutil.MultiCancel(cancels)
 
@@ -1803,7 +1861,7 @@ func (c *Cluster) globalPinInfoSlice(ctx context.Context, comp, method string) (
 		members,
 		comp,
 		method,
-		struct{}{},
+		arg,
 		rpcutil.CopyPinInfoSliceToIfaces(replies),
 	)
 

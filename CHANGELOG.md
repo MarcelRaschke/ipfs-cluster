@@ -1,5 +1,347 @@
 # IPFS Cluster Changelog
 
+### v0.14.0 - 2021-07-09
+
+This IPFS Cluster release brings a few features to improve cluster operations
+at scale (pinsets over 100k items), along with some bug fixes.
+
+This release is not fully compatible with previous ones. Nodes on different
+versions will be unable to parse metrics from each other (thus `peers ls`
+will not report peers on different versions) and the StatusAll RPC method
+(a.k.a `ipfs-cluster-ctl status` or `/pins` API endpoint) will not work. Hence
+the minor version bump. **Please upgrade all of your cluster peers**.
+
+This release brings a few key improvements to the cluster state storage:
+badger will automatically perform garbage collection on regular intervals,
+resolving a long standing issue of badger using up to 100x the actual needed
+space. Badger GC will automatically be enabled with defaults, which will
+result in increased disk I/O if there is a lot to GC 15 minutes after starting
+the peer. **Make sure to disable GC manually if increased disk I/O during GC
+may affect your service upon upgrade**. In our tests the impact was soft
+enough to consider this a safe default, though in environments with very
+constrained disk I/O it will be surely noticed, at least in the first GC
+cycle, since the datastore was never GC'ed before.
+
+Badger is the datastore we are more familiar with and the most scalable choice
+(chosen by both IPFS and Filecoin). However, it may be that badger behaviour
+and GC-needs are not best suited or not preferred, or more downsides are
+discovered in the future. For those cases, we have added the option to run
+with a leveldb backend as an alternative. Level DB does not need GC and it
+will auto-compact. It should also scale pretty well for most cases, though we
+have not tested or compared against badger with very large pinsets. The
+backend can be configured during the daemon `init`, along with the consensus
+component using a new `--datastore` flag. Like the default Badger backend, the
+new LevelDB backend exposes all LevelDB internal configuration options.
+
+Additionally, operators handling very large clusters may have noticed that
+checking status of pinning,queued items (`ipfs-cluster-ctl status --filter
+pinning,queued`) took very long as it listed and iterated on the full ipfs
+pinset. We have added some fixes so that we save the time when filtering for
+items that do not require listing the full state.
+
+Finally, cluster pins now have an `origins` option, which allows submitters to
+provide hints for providers of the content. Cluster will instruct IPFS to
+connect to the `origins` of a pin before pinning. Note that for the moment
+[ipfs will keep connected to those peers permanently](https://github.com/ipfs/ipfs-cluster/issues/1376).
+
+Please read carefully through the notes below, as the release includes subtle
+changes in configuration, defaults and behaviours which may in some cases
+affect you (although probably will not).
+
+#### List of changes
+
+##### Features
+
+* Set disable_repinning to true by default, for new configurations | [ipfs/ipfs-cluster#1398](https://github.com/ipfs/ipfs-cluster/issues/1398)
+* Efficient status queries with filters | [ipfs/ipfs-cluster#1360](https://github.com/ipfs/ipfs-cluster/issues/1360) | [ipfs/ipfs-cluster#1377](https://github.com/ipfs/ipfs-cluster/issues/1377) | [ipfs/ipfs-cluster#1399](https://github.com/ipfs/ipfs-cluster/issues/1399)
+* User-provided pin "origins" | [ipfs/ipfs-cluster#1374](https://github.com/ipfs/ipfs-cluster/issues/1374) | [ipfs/ipfs-cluster#1375](https://github.com/ipfs/ipfs-cluster/issues/1375)
+* Provide darwin/arm64 binaries (Apple M1). Needs testing! | [ipfs/ipfs-cluster#1369](https://github.com/ipfs/ipfs-cluster/issues/1369)
+* Set the "size" field in the response when adding CARs when the archive contains a single unixfs file | [ipfs/ipfs-cluster#1362](https://github.com/ipfs/ipfs-cluster/issues/1362) | [ipfs/ipfs-cluster#1372](https://github.com/ipfs/ipfs-cluster/issues/1372)
+* Support a leveldb-datastore backend | [ipfs/ipfs-cluster#1364](https://github.com/ipfs/ipfs-cluster/issues/1364) | [ipfs/ipfs-cluster#1373](https://github.com/ipfs/ipfs-cluster/issues/1373)
+* Speed up pin/ls by not filtering when not needed | [ipfs/ipfs-cluster#1405](https://github.com/ipfs/ipfs-cluster/issues/1405)
+
+##### Bug fixes
+
+* Badger datastore takes too much size | [ipfs/ipfs-cluster#1320](https://github.com/ipfs/ipfs-cluster/issues/1320) | [ipfs/ipfs-cluster#1370](https://github.com/ipfs/ipfs-cluster/issues/1370)
+* Fix: error-type responses from the IPFS proxy not understood by ipfs | [ipfs/ipfs-cluster#1366](https://github.com/ipfs/ipfs-cluster/issues/1366) | [ipfs/ipfs-cluster#1371](https://github.com/ipfs/ipfs-cluster/issues/1371)
+* Fix: adding with cid-version=1 does not automagically set raw-leaves | [ipfs/ipfs-cluster#1358](https://github.com/ipfs/ipfs-cluster/issues/1358) | [ipfs/ipfs-cluster#1359](https://github.com/ipfs/ipfs-cluster/issues/1359)
+* Tests: close datastore on test node shutdown | [ipfs/ipfs-cluster#1389](https://github.com/ipfs/ipfs-cluster/issues/1389)
+* Fix ipfs-cluster-ctl not using dns name when talking to remote https endpoints | [ipfs/ipfs-cluster#1403](https://github.com/ipfs/ipfs-cluster/issues/1403) | [ipfs/ipfs-cluster#1404](https://github.com/ipfs/ipfs-cluster/issues/1404)
+
+
+##### Other changes
+
+* Dependency upgrades | [ipfs/ipfs-cluster#1378](https://github.com/ipfs/ipfs-cluster/issues/1378) | [ipfs/ipfs-cluster#1395](https://github.com/ipfs/ipfs-cluster/issues/1395)
+* Update compose to use the latest go-ipfs | [ipfs/ipfs-cluster#1363](https://github.com/ipfs/ipfs-cluster/issues/1363)
+* Update IRC links to point to new Matrix channel | [ipfs/ipfs-cluster#1361](https://github.com/ipfs/ipfs-cluster/issues/1361)
+
+#### Upgrading notices
+
+##### Configuration changes
+
+Configurations are fully backwards compatible.
+
+The `cluster.disable_repinning` setting now defaults to true on new generated configurations.
+
+The `datastore.badger` section now includes settings to control (and disable) automatic GC:
+
+```json
+   "badger": {
+      "gc_discard_ratio": 0.2,
+      "gc_interval": "15m0s",
+      "gc_sleep": "10s",
+	  ...
+   }
+```
+
+**When not present, these settings take their defaults**, so GC will
+automatically be enabled on nodes that upgrade keeping their previous
+configurations.
+
+GC can be disabled by setting `gc_interval` to `"0s"`. A GC cycle is made by
+multiple GC rounds. Setting `gc_sleep` to `"0s"` will result in a single GC
+round.
+
+Finally, nodes initializing with `--datastore leveldb` will obtain a
+`datastore.leveldb` section (instead of a `badger` one). Configurations can
+only include one datastore section, either `badger` or `leveldb`. Currently we
+offer no way to convert states between the two datastore backends.
+
+##### REST API
+
+Pin options (`POST /add` and `POST /pins` endpoints) now take an `origins`
+query parameter as an additional pin option. It can be set to a
+comma-separated list of full peer multiaddresses to which IPFS can connect to
+fetch the content. Only the first 10 multiaddresses will be taken into
+account.
+
+The response of `POST /add?format=car` endpoint when adding a CAR file (a single
+pin progress object) always had the "size" field set to 0. This is now set to
+the unixfs FileSize property, when the root of added CAR correspond to a
+unixfs node of type File. In any other case, it stays at 0.
+
+The `GET /pins` endpoint reports pin status for all pins in the pinset by
+default and optionally takes a `filter` query param. Before, it would include
+a full GlobalPinInfo object for a pin as long as the status of the CID in one
+of the peers matched the filter, so the object could include statuses for
+other cluster peers for that CID which did not match the filter. Starting on
+this version, the returned statuses will be fully limited to those of the
+peers matching the filter.
+
+On the same endpoint, a new `unexpectedly_unpinned` pin status has been
+added, which can also be used as a filter. Previously, pins in this state were
+reported as `pin_error`. Note the `error` filter does not match
+`unexpectedly_unpinned` status as it did before, which should be queried
+directly (or without any filter).
+
+##### Go APIs
+
+The PinTracker interface has been updated so that the `StatusAll` method takes
+a TrackerStatus filter. The stateless pintracker implementation has been
+updated accordingly.
+
+##### Other
+
+Docker containers now support `IPFS_CLUSTER_DATASTORE` to set the datastore
+type during initialization (similar to `IPFS_CLUSTER_CONSENSUS`).
+
+Due to the deprecation of the multicodecs repository, we no longer serialize
+metrics by prepending the msgpack multicodec code to the bytes and instead
+encode the metrics directly. This means older peers will not know how to
+deserialize metrics from newer peers, and vice-versa. While peers will keep
+working (particularly follower peers will keep tracking content etc), peers
+will not include other peers with different versions in their "peerset and
+many operations that rely on this will not work as intended or show partial
+views.
+
+---
+
+### v0.13.3 - 2021-05-14
+
+IPFS Cluster v0.13.3 brings two new features: CAR file imports and crdt-commit batching.
+
+The first one allows to upload CAR files directly to the Cluster using the
+existing Add endpoint with a new option set: `/add?format=car`. The endpoint
+remains fully backwards compatible. CAR files are a simple wrapper around a
+collection of IPFS blocks making up a DAG. Thus, this enables arbitrary DAG
+imports directly through the Cluster REST API, taking advantange of the rest
+of its features like basic-auth access control, libp2p endpoint and multipeer
+block-put when adding.
+
+The second feature unlocks large escalability improvements for pin ingestion
+with the crdt "consensus" component. By default, each pin or unpin requests
+results in an insertion to the crdt-datastore-DAG that maintains and syncs the
+state between nodes, creating a new root. Batching allows to group multiple
+updates in a single crdt DAG-node. This reduces the number of broadcasts, the
+depth of the DAG, the breadth of the DAG and the syncing times when the
+Cluster is ingesting many pins, removing most of the overhead in the
+process. The batches are automatically commited when reaching a certain age or
+a certain size, both configurable.
+
+Additionally, improvements to timeout behaviours have been introduced.
+
+For more details, check the list below and the latest documentation on the
+[website](https://cluster.ipfs.io).
+
+#### List of changes
+
+##### Features
+
+* Support adding CAR files | [ipfs/ipfs-cluster#1343](https://github.com/ipfs/ipfs-cluster/issues/1343)
+* CRDT batching support | [ipfs/ipfs-cluster#1008](https://github.com/ipfs/ipfs-cluster/issues/1008) | [ipfs/ipfs-cluster#1346](https://github.com/ipfs/ipfs-cluster/issues/1346) | [ipfs/ipfs-cluster#1356](https://github.com/ipfs/ipfs-cluster/issues/1356)
+
+##### Bug fixes
+
+* Improve timeouts and timeout faster when dialing | [ipfs/ipfs-cluster#1350](https://github.com/ipfs/ipfs-cluster/issues/1350) | [ipfs/ipfs-cluster#1351](https://github.com/ipfs/ipfs-cluster/issues/1351)
+
+##### Other changes
+
+* Dependency upgrades | [ipfs/ipfs-cluster#1357](https://github.com/ipfs/ipfs-cluster/issues/1357)
+
+#### Upgrading notices
+
+##### Configuration changes
+
+The `crdt` section of the configuration now has a `batching` subsection which controls batching settings:
+
+```json
+"batching": {
+    "max_batch_size": 0,
+    "max_batch_age": "0s"
+}
+```
+
+An additional, hidden `max_queue_size` option exists, with default to
+`50000`. The meanings of the options are documented on the reference (website)
+and the code.
+
+Batching is disabled by default. To be enabled, both `max_batch_size` and
+`max_batch_age` need to be set to positive values.
+
+The `cluster` section of the configuration has a new `dial_peer_timeout`
+option, which defaults to "3s". It controls the default dial timeout when
+libp2p is attempting to open a connection to a peer.
+
+##### REST API
+
+The `/add` endpoint now understands a new query parameter `?format=`, which
+can be set to `unixfs` (default), or `car` (when uploading a CAR file). CAR
+files should have a single root. Additional parts in multipart uploads for CAR
+files are ignored.
+
+##### Go APIs
+
+The `AddParams` object that controls API options for the Add endpoint has been
+updated with the new `Format` option.
+
+##### Other
+
+Nothing.
+
+
+
+---
+
+### v0.13.2 - 2021-04-06
+
+IPFS Cluster v0.13.2 is a maintenance release addressing bugs and adding a
+couple of small features. It is fully compatible with the previous release.
+
+#### List of changes
+
+##### Features
+
+* Make mDNS failures non-fatal | [ipfs/ipfs-cluster#1193](https://github.com/ipfs/ipfs-cluster/issues/1193) | [ipfs/ipfs-cluster#1310](https://github.com/ipfs/ipfs-cluster/issues/1310)
+* Add `--wait` flag to `ipfs-cluster-ctl add` command | [ipfs/ipfs-cluster#1285](https://github.com/ipfs/ipfs-cluster/issues/1285) | [ipfs/ipfs-cluster#1301](https://github.com/ipfs/ipfs-cluster/issues/1301)
+
+##### Bug fixes
+
+* Stop using secio in REST API libp2p server and client | [ipfs/ipfs-cluster#1315](https://github.com/ipfs/ipfs-cluster/issues/1315) | [ipfs/ipfs-cluster#1316](https://github.com/ipfs/ipfs-cluster/issues/1316)
+* CID status wrongly reported as REMOTE | [ipfs/ipfs-cluster#1319](https://github.com/ipfs/ipfs-cluster/issues/1319) | [ipfs/ipfs-cluster#1331](https://github.com/ipfs/ipfs-cluster/issues/1331)
+
+
+##### Other changes
+
+* Dependency upgrades | [ipfs/ipfs-cluster#1335](https://github.com/ipfs/ipfs-cluster/issues/1335)
+* Use cid.Cid as map keys in Pintracker | [ipfs/ipfs-cluster#1322](https://github.com/ipfs/ipfs-cluster/issues/1322)
+
+#### Upgrading notices
+
+##### Configuration changes
+
+No configuration changes in this release.
+
+##### REST API
+
+The REST API server and clients will no longer negotiate the secio
+security. This transport was already the lowest priority one and should have
+not been used. This however, may break 3rd party clients which only supported
+secio.
+
+
+##### Go APIs
+
+Nothing.
+
+##### Other
+
+Nothing.
+
+---
+
+### v0.13.1 - 2021-01-14
+
+IPFS Cluster v0.13.1 is a maintenance release with some bugfixes and updated
+dependencies. It should be fully backwards compatible.
+
+This release deprecates `secio` (as required by libp2p), but this was already
+the lowest priority security transport and `tls` would have been used by default.
+The new `noise` transport becomes the preferred option.
+
+#### List of changes
+
+##### Features
+
+* Support for multiple architectures added to the Docker container | [ipfs/ipfs-cluster#1085](https://github.com/ipfs/ipfs-cluster/issues/1085) | [ipfs/ipfs-cluster#1196](https://github.com/ipfs/ipfs-cluster/issues/1196)
+* Add `--name` and `--expire` to `ipfs-cluster-ctl pin update` | [ipfs/ipfs-cluster#1184](https://github.com/ipfs/ipfs-cluster/issues/1184) | [ipfs/ipfs-cluster#1195](https://github.com/ipfs/ipfs-cluster/issues/1195)
+* Failover client integrated in `ipfs-cluster-ctl` | [ipfs/ipfs-cluster#1222](https://github.com/ipfs/ipfs-cluster/issues/1222) | [ipfs/ipfs-cluster#1250](https://github.com/ipfs/ipfs-cluster/issues/1250)
+* `ipfs-cluster-ctl health alerts` lists the last expired metrics seen by the peer | [ipfs/ipfs-cluster#165](https://github.com/ipfs/ipfs-cluster/issues/165) | [ipfs/ipfs-cluster#978](https://github.com/ipfs/ipfs-cluster/issues/978)
+
+##### Bug fixes
+
+* IPFS Proxy: pin progress objects wrongly includes non empty `Hash` key | [ipfs/ipfs-cluster#1286](https://github.com/ipfs/ipfs-cluster/issues/1286) | [ipfs/ipfs-cluster#1287](https://github.com/ipfs/ipfs-cluster/issues/1287)
+* CRDT: Fix pubsub peer validation check | [ipfs/ipfs-cluster#1288](https://github.com/ipfs/ipfs-cluster/issues/1288)
+
+##### Other changes
+
+* Typos | [ipfs/ipfs-cluster#1181](https://github.com/ipfs/ipfs-cluster/issues/1181) | [ipfs/ipfs-cluster#1183](https://github.com/ipfs/ipfs-cluster/issues/1183)
+* Reduce default pin_timeout to 2 minutes | [ipfs/ipfs-cluster#1160](https://github.com/ipfs/ipfs-cluster/issues/1160)
+* Dependency upgrades | [ipfs/ipfs-cluster#1125](https://github.com/ipfs/ipfs-cluster/issues/1125) | [ipfs/ipfs-cluster#1238](https://github.com/ipfs/ipfs-cluster/issues/1238)
+* Remove `secio` security transport | [ipfs/ipfs-cluster#1214](https://github.com/ipfs/ipfs-cluster/issues/1214) | [ipfs/ipfs-cluster#1227](https://github.com/ipfs/ipfs-cluster/issues/1227)
+
+#### Upgrading notices
+
+##### Configuration changes
+
+The new default for `ipfs_http.pin_timeout` is `2m`. This is the time that
+needs to pass for a pin operation to error and it starts counting from the
+last block pinned.
+
+##### REST API
+
+A new `/health/alerts` endpoint exists to support `ipfs-cluster-ctl health alerts`.
+
+##### Go APIs
+
+The definition of `types.Alert` has changed. This type was not exposed to the
+outside before. RPC endpoints affected are only used locally.
+
+##### Other
+
+Nothing.
+
+---
+
 ### v0.13.0 - 2020-05-19
 
 IPFS Cluster v0.13.0 provides many improvements and bugfixes on multiple fronts.
